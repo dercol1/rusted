@@ -35,8 +35,10 @@ var promptRe = regexp.MustCompile(`(?m)^[\w.@:()\[\]\-/ ]+[#>$]\s*$`)
 // RouterOS) colourise their CLI even over a programmatic session.
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
-// Dial implements Transport.
-func (*SSH) Dial(ctx context.Context, t Target) (Session, error) {
+// dialClient opens an authenticated SSH client to the target with the widened
+// (legacy-friendly) KEX/cipher set network gear often needs. Shared by the
+// interactive SSH transport and the exec transport (ssh-exec).
+func dialClient(ctx context.Context, t Target) (*ssh.Client, error) {
 	if t.Port == 0 {
 		t.Port = 22
 	}
@@ -89,7 +91,15 @@ func (*SSH) Dial(ctx context.Context, t Target) (Session, error) {
 		conn.Close()
 		return nil, fmt.Errorf("ssh handshake with %s: %w", addr, err)
 	}
-	client := ssh.NewClient(sc, chans, reqs)
+	return ssh.NewClient(sc, chans, reqs), nil
+}
+
+// Dial implements Transport.
+func (*SSH) Dial(ctx context.Context, t Target) (Session, error) {
+	client, err := dialClient(ctx, t)
+	if err != nil {
+		return nil, err
+	}
 
 	sess, err := client.NewSession()
 	if err != nil {

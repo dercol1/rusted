@@ -89,20 +89,25 @@ func (e *Engine) backup(ctx context.Context, dev *store.Device) *Result {
 		return finish("failed", "device has no credential", "", 0)
 	}
 
-	// A device can pin its own transport (e.g. "routeros-api"); otherwise use the
-	// engine default (ssh).
+	drv, known := driver.Get(dev.Driver)
+	if !known {
+		// Not fatal: generic driver is used, but note it.
+		res.Message = fmt.Sprintf("unknown driver %q, used generic", dev.Driver)
+	}
+
+	// Transport precedence: a device can pin its own ("routeros-api"), else the
+	// driver's preferred transport (MikroTik pins "ssh-exec"), else the engine
+	// default (interactive ssh).
 	transportName := e.Transport
+	if drv.Transport != "" {
+		transportName = drv.Transport
+	}
 	if dev.Transport != "" {
 		transportName = dev.Transport
 	}
 	tr, err := transport.Get(transportName)
 	if err != nil {
 		return finish("failed", err.Error(), "", 0)
-	}
-	drv, known := driver.Get(dev.Driver)
-	if !known {
-		// Not fatal: generic driver is used, but note it.
-		res.Message = fmt.Sprintf("unknown driver %q, used generic", dev.Driver)
 	}
 
 	tgt := transport.Target{

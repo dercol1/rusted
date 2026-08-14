@@ -20,6 +20,11 @@ import (
 type Driver struct {
 	Name        string
 	Description string
+	// Transport is this platform's preferred transport when a device doesn't pin
+	// its own. Empty = the engine default (interactive ssh). Set "ssh-exec" for a
+	// platform whose interactive CLI is unreliable to script (e.g. MikroTik, whose
+	// "/export" starves the interactive reader while it gathers the config).
+	Transport string
 	// Init commands run once after login, e.g. to disable paging.
 	Init []string
 	// Config commands whose combined output forms the saved configuration.
@@ -160,6 +165,11 @@ func builtins() []Driver {
 		{
 			Name:        "mikrotik_routeros",
 			Description: "MikroTik RouterOS v7+",
+			// Capture over an exec channel, not the interactive shell: RouterOS
+			// gathers the whole "/export" before emitting anything, which starves
+			// the interactive idle-timeout reader and yields an empty capture
+			// (rusted#2). `ssh host "/export terse"` reads to EOF and works.
+			Transport: "ssh-exec",
 			// "/export terse" emits one full path per line, which diffs far more
 			// cleanly than the default sectioned output. Sensitive values are
 			// hidden by default in v7 (good for a git-stored backup).
