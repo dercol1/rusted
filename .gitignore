@@ -12,3 +12,4 @@
 
 # Local env / secrets
 .env
+dist/

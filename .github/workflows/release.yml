@@ -1,0 +1,87 @@
+name: Release
+
+# Tag a version (e.g. v0.1.0) to build the static binaries + the .deb packages and
+# publish them as a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: Static binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: auto
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags "-s -w" -o rusted ./cmd/rusted
+          tar czf "rusted_${VERSION}_${GOOS}_${GOARCH}.tar.gz" rusted README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusted-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: rusted_*.tar.gz
+          if-no-files-found: error
+
+  debs:
+    name: Debian package (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: auto
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build .deb
+        run: VERSION="${GITHUB_REF_NAME#v}" ARCH="${{ matrix.arch }}" bash packaging/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusted-deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [binaries, debs]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect artifacts + checksums
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.deb' \) -exec cp {} dist/ \;
+          cd dist && sha256sum * > SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/SHA256SUMS
+          fail_on_unmatched_files: false
+          generate_release_notes: true

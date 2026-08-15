@@ -1,0 +1,15 @@
+[Unit]
+Description=rusted network configuration backup engine
+Documentation=https://github.com/JoshFinlayAU/rusted
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rusted --config /etc/rusted/config.toml serve
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/rusted
+
+[Install]
+WantedBy=multi-user.target

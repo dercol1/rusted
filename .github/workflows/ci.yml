@@ -1,0 +1,28 @@
+name: CI
+
+# Build, vet and test on every push to main and every PR. Keeps the tree green
+# between releases; the release workflow (tags) reuses the same build.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-24.04
+    env:
+      # go.mod pins a newer toolchain than setup-go installs; let the go command
+      # fetch the exact version named there (same as the Docker build does).
+      GOTOOLCHAIN: auto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
