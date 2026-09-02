@@ -11,7 +11,7 @@
         </a>
     </h2>
 
-    <div id="sync-alerts"></div>
+    @include('rusted::partials.sticky-alerts', ['id' => 'sync-alerts'])
 
     <div class="row">
         <!-- LEFT: LibreNMS devices not actively backed up by rusted -->
@@ -76,13 +76,16 @@
         }[c]));
     }
 
+    // Alerts stay on screen until closed with the &times; button; the container
+    // is fixed to the viewport, so they never scroll out of sight.
+    // Success ("ok") messages fade away after 10s, the rest after 120s.
     function alertBox(type, msg) {
         const d = document.getElementById('sync-alerts');
         const div = document.createElement('div');
         div.className = 'alert alert-' + type + ' alert-dismissable';
         div.innerHTML = '<button type="button" class="close" data-dismiss="alert">&times;</button>' + esc(msg);
         d.appendChild(div);
-        setTimeout(() => div.remove(), 10000);
+        setTimeout(() => div.remove(), type === 'success' ? 10000 : 120000);
     }
 
     async function apiJson(method, path, body) {

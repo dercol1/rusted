@@ -8,7 +8,7 @@
         <i class="fa fa-floppy-o"></i> Rusted &mdash; <span id="rusted-dev-title">{{ $hostname }}</span>
     </h2>
 
-    <div id="rusted-alerts"></div>
+    @include('rusted::partials.sticky-alerts', ['id' => 'rusted-alerts'])
 
     <div class="text-muted" id="rusted-meta" style="margin-bottom:12px">
         <em>Loading device&hellip;</em>
@@ -86,12 +86,15 @@
         }[c]));
     }
 
+    // Alerts stay on screen until closed with the &times; button; the container
+    // is fixed to the viewport, so they never scroll out of sight.
+    // Success ("ok") messages fade away after 10s, the rest after 120s.
     function alertBox(type, msg) {
         const div = document.createElement('div');
         div.className = 'alert alert-' + type + ' alert-dismissable';
         div.innerHTML = '<button type="button" class="close" data-dismiss="alert">&times;</button>' + esc(msg);
         $alerts.appendChild(div);
-        setTimeout(() => div.remove(), 8000);
+        setTimeout(() => div.remove(), type === 'success' ? 10000 : 120000);
     }
 
     async function apiText(method, path, query) {

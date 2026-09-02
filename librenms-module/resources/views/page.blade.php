@@ -14,7 +14,7 @@
         </button>
     </h2>
 
-    <div id="rusted-alerts"></div>
+    @include('rusted::partials.sticky-alerts', ['id' => 'rusted-alerts'])
 
     @csrf
 
@@ -148,12 +148,15 @@
         }[c]));
     }
 
+    // Alerts stay on screen until closed with the &times; button; the container
+    // is fixed to the viewport, so they never scroll out of sight.
+    // Success ("ok") messages fade away after 10s, the rest after 120s.
     function alertBox(type, msg) {
         const div = document.createElement('div');
         div.className = 'alert alert-' + type + ' alert-dismissable';
         div.innerHTML = '<button type="button" class="close" data-dismiss="alert">&times;</button>' + esc(msg);
         $alerts.appendChild(div);
-        setTimeout(() => div.remove(), 8000);
+        setTimeout(() => div.remove(), type === 'success' ? 10000 : 120000);
     }
 
     async function api(method, path, body) {
