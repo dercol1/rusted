@@ -107,7 +107,7 @@ func Names() []string {
 // removed. Used for pager-prompt detection.
 func lastLine(b []byte) string {
 	s := strings.TrimRight(string(b), " \t\r\n")
-	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+	if i := strings.LastIndexAny(s, "\n\r"); i >= 0 {
 		s = s[i+1:]
 	}
 	return s
@@ -125,7 +125,7 @@ func trailingMatches(b []byte, re *regexp.Regexp) bool {
 		return false
 	}
 	line := t
-	if i := bytes.LastIndexByte(t, '\n'); i >= 0 {
+	if i := bytes.LastIndexAny(t, "\n\r"); i >= 0 {
 		line = t[i+1:]
 	}
 	return re.Match(line)

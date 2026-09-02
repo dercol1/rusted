@@ -7,10 +7,26 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
 func init() { Register(&Telnet{}) }
+
+// Telnet protocol verbs and options (RFC 854/855 and friends).
+const (
+	iacSE   byte = 240
+	iacSB   byte = 250
+	iacWILL byte = 251
+	iacWONT byte = 252
+	iacDO   byte = 253
+	iacDONT byte = 254
+	iacIAC  byte = 255
+
+	optEcho  byte = 1
+	optSGA   byte = 3
+	optTType byte = 24
+)
 
 // Telnet speaks raw TCP (RFC 854/855) to devices that only offer a telnet CLI —
 // classic Cisco IOS over telnet, console-server access, etc. It performs the
@@ -103,7 +119,7 @@ func (s *telnetSession) login(username, password string) error {
 			if loginStage == 0 && passwordPrompt.MatchString(text) && password != "" {
 				// Device asked for a password directly (no username prompt).
 				s.debugf(">>> %s\n", password)
-				if _, err := io.WriteString(s.conn, password+"\r\n"); err != nil {
+				if err := s.write([]byte(password + "\r\n")); err != nil {
 					return err
 				}
 				loginStage = 2
@@ -117,7 +133,7 @@ func (s *telnetSession) login(username, password string) error {
 				idle.Reset(loginIdle)
 			} else if loginStage == 0 && usernamePrompt.MatchString(text) && username != "" {
 				s.debugf(">>> %s\n", username)
-				if _, err := io.WriteString(s.conn, username+"\r\n"); err != nil {
+				if err := s.write([]byte(username + "\r\n")); err != nil {
 					return err
 				}
 				loginStage = 1
@@ -131,7 +147,7 @@ func (s *telnetSession) login(username, password string) error {
 				idle.Reset(loginIdle)
 			} else if loginStage >= 1 && passwordPrompt.MatchString(text) && password != "" {
 				s.debugf(">>> %s\n", password)
-				if _, err := io.WriteString(s.conn, password+"\r\n"); err != nil {
+				if err := s.write([]byte(password + "\r\n")); err != nil {
 					return err
 				}
 				loginStage = 2
@@ -180,6 +196,8 @@ func (s *telnetSession) login(username, password string) error {
 
 type telnetSession struct {
 	conn        net.Conn
+	wmu         sync.Mutex
+	pend        []byte
 	out         chan []byte
 	done        chan error
 	idle        time.Duration
@@ -194,15 +212,109 @@ func (s *telnetSession) debugf(format string, args ...any) {
 	}
 }
 
+func (s *telnetSession) write(p []byte) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	_, err := s.conn.Write(p)
+	return err
+}
+
+// negotiate filters one chunk of raw device output through the telnet state
+// machine: protocol sequences are answered and stripped from the CLI stream
+// the rest of the transport sees, with partial sequences buffered until the
+// next chunk completes them.
+func (s *telnetSession) negotiate(chunk []byte) (visible, reply []byte) {
+	data := append(s.pend, chunk...)
+	s.pend = nil
+	for i := 0; i < len(data); {
+		if data[i] != iacIAC {
+			j := bytes.IndexByte(data[i:], iacIAC)
+			if j < 0 {
+				visible = append(visible, data[i:]...)
+				break
+			}
+			visible = append(visible, data[i:i+j]...)
+			i += j
+			continue
+		}
+		if i+1 >= len(data) {
+			s.pend = append(s.pend, data[i:]...)
+			break
+		}
+		switch data[i+1] {
+		case iacIAC:
+			visible = append(visible, iacIAC)
+			i += 2
+		case iacWILL, iacWONT, iacDO, iacDONT:
+			if i+2 >= len(data) {
+				s.pend = append(s.pend, data[i:]...)
+				i = len(data)
+				break
+			}
+			reply = append(reply, negotiateReply(data[i+1], data[i+2])...)
+			i += 3
+		case iacSB:
+			end := bytes.Index(data[i+2:], []byte{iacIAC, iacSE})
+			if end < 0 {
+				s.pend = append(s.pend, data[i:]...)
+				i = len(data)
+				break
+			}
+			reply = append(reply, subnegotiationReply(data[i+2:i+2+end])...)
+			i += end + 4
+		default:
+			i += 2
+		}
+	}
+	if bytes.IndexByte(visible, 0) >= 0 {
+		visible = bytes.ReplaceAll(visible, []byte{0}, nil)
+	}
+	return visible, reply
+}
+
+// negotiateReply is our side of option negotiation: agree to suppress-go-ahead
+// and offer a terminal type (devices block until someone answers the TTYPE
+// probe), refuse everything else.
+func negotiateReply(verb, opt byte) []byte {
+	switch verb {
+	case iacDO:
+		switch opt {
+		case optTType, optSGA:
+			return []byte{iacIAC, iacWILL, opt}
+		}
+		return []byte{iacIAC, iacWONT, opt}
+	case iacWILL:
+		switch opt {
+		case optEcho, optSGA:
+			return []byte{iacIAC, iacDO, opt}
+		}
+		return []byte{iacIAC, iacDONT, opt}
+	}
+	return nil
+}
+
+func subnegotiationReply(sub []byte) []byte {
+	if len(sub) >= 2 && sub[0] == optTType && sub[1] == 1 {
+		return append([]byte{iacIAC, iacSB, optTType, 0}, append([]byte("xterm"), iacIAC, iacSE)...)
+	}
+	return nil
+}
+
 func (s *telnetSession) reader() {
 	buf := make([]byte, 8192)
 	for {
 		n, err := s.conn.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			s.debugf("<<< %s", string(chunk))
-			s.out <- chunk
+			visible, reply := s.negotiate(buf[:n])
+			if len(reply) > 0 {
+				_ = s.write(reply)
+			}
+			if len(visible) > 0 {
+				chunk := make([]byte, len(visible))
+				copy(chunk, visible)
+				s.debugf("<<< %s", chunk)
+				s.out <- chunk
+			}
 		}
 		if err != nil {
 			s.done <- err
@@ -243,7 +355,7 @@ func (s *telnetSession) drain(maxWait time.Duration) (string, bool, string) {
 			idle.Reset(s.idle)
 			if morePromptRe.MatchString(lastLine(buf.Bytes())) {
 				s.debugf(">>> [space]\n")
-				_, _ = io.WriteString(s.conn, " ")
+				_ = s.write([]byte(" "))
 			}
 			if endsWithPrompt(buf.Bytes()) {
 				return buf.String(), false, ""
@@ -254,7 +366,7 @@ func (s *telnetSession) drain(maxWait time.Duration) (string, bool, string) {
 			}
 			if morePromptRe.MatchString(lastLine(buf.Bytes())) {
 				s.debugf(">>> [space]\n")
-				_, _ = io.WriteString(s.conn, " ")
+				_ = s.write([]byte(" "))
 				idle.Reset(s.idle)
 				continue
 			}
@@ -280,7 +392,7 @@ func (s *telnetSession) SendCommand(cmd string) (string, error) {
 	if err := s.conn.SetWriteDeadline(deadline); err != nil {
 		return "", err
 	}
-	if _, err := io.WriteString(s.conn, cmd+"\r\n"); err != nil {
+	if err := s.write([]byte(cmd + "\r\n")); err != nil {
 		return "", err
 	}
 	raw, timedOut, reason := s.drain(s.readTimeout)
@@ -319,7 +431,7 @@ func (s *telnetSession) respondToEnablePrompt(raw string) string {
 		return raw
 	}
 	s.debugf(">>> [enable password]\n")
-	if _, err := io.WriteString(s.conn, s.enable+"\r\n"); err != nil {
+	if err := s.write([]byte(s.enable + "\r\n")); err != nil {
 		return raw
 	}
 	raw += func() string {
@@ -332,6 +444,6 @@ func (s *telnetSession) respondToEnablePrompt(raw string) string {
 // Close implements Session.
 func (s *telnetSession) Close() error {
 	_ = s.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, _ = io.WriteString(s.conn, "exit\r\n")
+	_ = s.write([]byte("exit\r\n"))
 	return s.conn.Close()
 }

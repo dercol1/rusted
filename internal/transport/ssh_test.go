@@ -234,6 +234,10 @@ func TestTrailingPromptDetection(t *testing.T) {
 	if endsWithPrompt([]byte("this whole line looks like a prompt#\n")) {
 		t.Error("newline-terminated lookalike must not be treated as a prompt")
 	}
+	// NX-OS over telnet emits a stray \r (and NUL) before the login prompt.
+	if !endsWithPrompt([]byte("...lgpl-2.1.php\r\n\rsw1# ")) {
+		t.Error("bare prompt after stray \\r not detected")
+	}
 	if endsWithPrompt([]byte("")) {
 		t.Error("empty buffer must not look like a prompt")
 	}

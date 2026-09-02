@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"strconv"
@@ -333,5 +334,130 @@ func TestTelnetPromptLikeContentDoesNotComplete(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output ended prematurely, missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// Devices such as NX-OS open with IAC DO TTYPE / DO TERMINAL-SPEED /
+// DO X-DISPLAY-LOCATION and refuse to show the login prompt until the client
+// answers the negotiation. A transport that passes the bytes through raw hangs
+// forever in "login deadline exceeded".
+func TestTelnetNegotiationUnblocksLogin(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	var mu sync.Mutex
+	var gotNego, gotTType []byte
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 256)
+
+		readN := func(n int) []byte {
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			defer conn.SetReadDeadline(time.Time{})
+			var got []byte
+			for len(got) < n {
+				m, err := conn.Read(buf)
+				got = append(got, buf[:m]...)
+				if err != nil {
+					return got
+				}
+			}
+			return got
+		}
+		write := func(b []byte) { _, _ = conn.Write(b) }
+
+		write([]byte{0xff, 0xfd, 24, 0xff, 0xfd, 32, 0xff, 0xfd, 35, 0xff, 0xfd, 39}) // DO TTYPE, DO TERMSPEED, DO XDISPLOC, DO NEW-ENVIRON
+		mu.Lock()
+		gotNego = readN(12)
+		mu.Unlock()
+		write([]byte{0xff, 0xfa, 24, 1, 0xff, 0xf0}) // SB TTYPE SEND SE
+		mu.Lock()
+		gotTType = readN(11)
+		mu.Unlock()
+
+		write([]byte("sw-san-1 login: "))
+		conn.Read(buf) // username
+		write([]byte("Password: "))
+		conn.Read(buf) // password
+		write([]byte("Nexus Operating System (NX-OS) Software\r\nlicenses\r\n\r\x00sw1# "))
+		conn.Read(buf) // terminal length 0
+		write([]byte("sw1# "))
+		conn.Read(buf) // show version
+		write([]byte("NXOS version 10.3(5)\r\n\r\x00sw1# "))
+	}()
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	tr, _ := Get("telnet")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	sess, err := tr.Dial(ctx, Target{
+		Host:     host,
+		Port:     port,
+		Timeout:  5 * time.Second,
+		Username: "admin",
+		Password: "secret",
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sess.Close()
+
+	if _, err := sess.SendCommand("terminal length 0"); err != nil {
+		t.Fatalf("SendCommand terminal length 0: %v", err)
+	}
+	out, err := sess.SendCommand("show version")
+	if err != nil {
+		t.Fatalf("SendCommand show version: %v", err)
+	}
+	if !strings.Contains(out, "version 10.3(5)") {
+		t.Fatalf("missing command output:\n%s", out)
+	}
+	if strings.ContainsRune(out, 0xff) || strings.ContainsRune(out, 0xfa) {
+		t.Fatalf("telnet protocol bytes leaked into output: %q", out)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantNego := []byte{0xff, 0xfb, 24, 0xff, 0xfc, 32, 0xff, 0xfc, 35, 0xff, 0xfc, 39}
+	if !bytes.Equal(gotNego, wantNego) {
+		t.Fatalf("negotiation reply = % x, want % x", gotNego, wantNego)
+	}
+	wantTType := append([]byte{0xff, 0xfa, 24, 0}, "xterm"...)
+	wantTType = append(wantTType, 0xff, 0xf0)
+	if !bytes.Equal(gotTType, wantTType) {
+		t.Fatalf("ttype reply = % x, want % x", gotTType, wantTType)
+	}
+}
+
+func TestTelnetNegotiationStateMachine(t *testing.T) {
+	s := &telnetSession{}
+	vis, rep := s.negotiate([]byte{0xff, 0xfd})
+	if len(vis) != 0 || len(rep) != 0 || len(s.pend) != 2 {
+		t.Fatalf("partial IAC not buffered: vis=%q rep=% x pend=% x", vis, rep, s.pend)
+	}
+	vis, rep = s.negotiate([]byte{24, 'a', 0xff, 0xff, 'b'})
+	if string(vis) != "a\xffb" {
+		t.Fatalf("visible = %q, want %q", vis, "a\xffb")
+	}
+	if !bytes.Equal(rep, []byte{0xff, 0xfb, 24}) {
+		t.Fatalf("reply = % x, want % x", rep, []byte{0xff, 0xfb, 24})
+	}
+
+	s2 := &telnetSession{}
+	vis, rep = s2.negotiate([]byte{0xff, 0xfb, 1, 0xff, 0xfb, 3, 'o', 0xff, 0xfa, 39, 1, 0, 0xff, 0xf0, 'k'})
+	want := []byte{0xff, 0xfd, 1, 0xff, 0xfd, 3}
+	if string(vis) != "ok" || !bytes.Equal(rep, want) {
+		t.Fatalf("vis=%q rep=% x, want %q / % x", vis, rep, "ok", want)
 	}
 }
