@@ -473,6 +473,29 @@ func (s *Store) UpdateDeviceGroup(name, group string) error {
 	return nil
 }
 
+// RenameDevice changes a device's name in place. The row keeps its id, so
+// backup_runs (and thus 'backup history') survive the rename. When the host
+// was left at its default (equal to the old name, as 'device add' sets it),
+// the host follows the new name; an explicit custom host is preserved.
+func (s *Store) RenameDevice(oldName, newName string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE devices SET name = ? WHERE name = ?`, newName, oldName)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(`UPDATE devices SET host = ? WHERE name = ? AND host = ?`, newName, newName, oldName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // DeleteDevice removes a device and its backup history.
 func (s *Store) DeleteDevice(name string) error {
 	res, err := s.db.Exec(`DELETE FROM devices WHERE name = ?`, name)

@@ -118,6 +118,12 @@ rusted device add ios-1  -H 10.0.0.4 -d cisco_ios -c lab \
 # Update an existing device (change transport, driver, timeouts, etc.)
 rusted device update ios-1 --transport telnet --cmd-timeout 120
 
+# Rename a device, keeping its history. This moves the config file in the
+# backup repo (git mv) and reuses the same DB row, so old backups stay
+# viewable/diffable and 'backup history' survives under the new name — use it
+# instead of add-new + remove-old, which would drop the history.
+rusted device rename old-name new-name
+
 # Back up one device, or everything enabled
 rusted backup run nexus1
 rusted backup run --all
@@ -139,7 +145,7 @@ rusted device remove ios-1 --purge-history
 | `rusted init` | Create the DB and backup repo |
 | `rusted config init/show` | Create or display the config file |
 | `rusted cred add/list/remove` | Manage login credentials |
-| `rusted device add/list/remove/update/enable/disable` | Manage device inventory |
+| `rusted device add/list/remove/rename/update/enable/disable` | Manage device inventory |
 | `rusted driver list` | List platform drivers |
 | `rusted backup run [NAME] [--all]` | Run backups |
 | `rusted backup run NAME --raw` | Run a backup saving the config verbatim (volatile fields included) |

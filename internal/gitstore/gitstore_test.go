@@ -103,6 +103,95 @@ func TestLogDetailed(t *testing.T) {
 	}
 }
 
+func TestRenameDevice(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Save("dc/sw1.cfg", "v1\n", "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Save("dc/sw1.cfg", "v2\n", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameDevice("dc/sw1.cfg", "dc/sw2.cfg"); err != nil {
+		t.Fatalf("RenameDevice: %v", err)
+	}
+	if got, err := s.Latest("dc/sw2.cfg"); err != nil || got != "v2\n" {
+		t.Fatalf("latest after rename = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, "dc", "sw1.cfg")); !os.IsNotExist(err) {
+		t.Fatal("old path still in worktree")
+	}
+
+	// --follow must carry the pre-rename versions under the new name,
+	// without surfacing the rename commit itself.
+	entries, err := s.LogDetailed("dc/sw2.cfg", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subjects := map[string]bool{}
+	for _, e := range entries {
+		if strings.Contains(e.Subject, "Rename backup") {
+			t.Fatalf("rename commit leaked into version list: %+v", e)
+		}
+		subjects[e.Subject] = true
+	}
+	for _, want := range []string{"first", "second"} {
+		if !subjects[want] {
+			t.Fatalf("pre-rename version %q missing from history: %+v", want, entries)
+		}
+	}
+
+	// Content of a pre-rename commit must be viewable under the NEW path
+	// (At/Diff resolve the historical path).
+	var first string
+	for _, e := range entries {
+		if e.Subject == "first" {
+			first = e.Commit
+		}
+	}
+	if got, err := s.At("dc/sw2.cfg", first); err != nil || got != "v1\n" {
+		t.Fatalf("At(new, old commit) = %q, %v", got, err)
+	}
+	if d, err := s.Diff("dc/sw2.cfg", first, ""); err != nil || !strings.Contains(d, "+v1") {
+		t.Fatalf("Diff(old commit) = %q, %v", d, err)
+	}
+
+	// Post-rename backups join the same lineage.
+	if _, err := s.Save("dc/sw2.cfg", "v3\n", "third"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = s.LogDetailed("dc/sw2.cfg", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subjects = map[string]bool{}
+	for _, e := range entries {
+		subjects[e.Subject] = true
+	}
+	if !subjects["third"] || !subjects["first"] {
+		t.Fatalf("history broken across rename: %+v", entries)
+	}
+
+	// An occupied target is refused (no silent overwrite).
+	if _, err := s.Save("dc/taken.cfg", "x\n", "other"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameDevice("dc/sw2.cfg", "dc/taken.cfg"); err == nil {
+		t.Fatal("expected an error renaming onto an existing path")
+	}
+	// A device that was never backed up renames without touching the repo.
+	head, _ := s.git("rev-parse", "HEAD")
+	if err := s.RenameDevice("dc/ghost.cfg", "dc/fresh.cfg"); err != nil {
+		t.Fatalf("never-backed-up rename = %v, want no-op", err)
+	}
+	after, _ := s.git("rev-parse", "HEAD")
+	if head != after {
+		t.Fatal("no-op rename must not create a commit")
+	}
+}
+
 func TestRemoveDevice(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {

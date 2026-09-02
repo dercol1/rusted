@@ -119,29 +119,83 @@ func (s *Store) Latest(relPath string) (string, error) {
 
 // At returns the stored content of relPath as it was at a specific commit
 // (git show <commit>:<relPath>). The commit ref is validated by the caller.
+// If relPath is the result of a device rename, the historical path in force at
+// that commit is resolved automatically, so old backups stay readable under the
+// device's new name.
 func (s *Store) At(relPath, commit string) (string, error) {
-	return s.git("show", commit+":"+filepath.Clean(relPath))
+	return s.git("show", commit+":"+s.pathAt(relPath, commit))
+}
+
+// pathAt reports the path relPath carried at commit, following rename
+// records backwards through the file's history (git log --follow). Returns
+// relPath unchanged when no rename intervened or the lineage can't be read.
+func (s *Store) pathAt(relPath, commit string) string {
+	rel := filepath.Clean(relPath)
+	if commit == "" {
+		return rel
+	}
+	out, err := s.git("log", "--follow", "--name-status", "--format=%H", "--", rel)
+	if err != nil {
+		return rel
+	}
+	cur := rel
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.Fields(ln)
+		if len(f) == 0 {
+			continue
+		}
+		if isFullHash(f[0]) {
+			if strings.HasPrefix(f[0], commit) {
+				return cur
+			}
+			continue
+		}
+		// Rename lines ("R1xx old new") cross the boundary: before this
+		// commit the file lived under the old name.
+		if f[0][0] == 'R' && len(f) == 3 && f[2] == cur {
+			cur = f[1]
+		}
+	}
+	return rel
+}
+
+func isFullHash(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // Diff returns a unified diff of relPath between two commits. An empty `to`
 // means HEAD; an empty `from` diffs the commit against its own parent, which is
-// the natural "what changed in this backup" view.
+// the natural "what changed in this backup" view. Both sides resolve their
+// historical path first, so a rename in the range doesn't blank the diff.
 func (s *Store) Diff(relPath, from, to string) (string, error) {
 	rel := filepath.Clean(relPath)
 	if from != "" && to == "" {
 		// Changes introduced by `from` itself. diff-tree --root makes even the first
 		// backup (no parent) show as a full addition rather than erroring.
-		return s.git("diff-tree", "-p", "--root", "--no-commit-id", from, "--", rel)
+		return s.git("diff-tree", "-p", "--root", "--no-commit-id", from, "--", s.pathAt(rel, from))
 	}
 	if to == "" {
 		to = "HEAD"
 	}
-	return s.git("diff", from, to, "--", rel)
+	pf, pt := s.pathAt(rel, from), s.pathAt(rel, to)
+	if pf == pt {
+		return s.git("diff", from, to, "--", pf)
+	}
+	return s.git("diff", from, to, "--", pf, pt)
 }
 
 // Log returns up to n short log entries ("<hash> <subject>") for relPath.
+// --follow walks across renames, so history survives a device rename.
 func (s *Store) Log(relPath string, n int) ([]string, error) {
-	out, err := s.git("log", fmt.Sprintf("-n%d", n), "--pretty=format:%h %ad %s", "--date=short", "--", relPath)
+	out, err := s.git("log", fmt.Sprintf("-n%d", n), "--follow", "--pretty=format:%h %ad %s", "--date=short", "--", relPath)
 	if err != nil {
 		return nil, err
 	}
@@ -165,12 +219,15 @@ type LogEntry struct {
 // timestamp and author, so exports can state exactly when each version was
 // stored. Newest first. Removal commits (a deleted device) are excluded, so
 // callers only ever see revisions where the configuration actually existed.
+// Rename commits are excluded too: they carry no content change, and the
+// pre-rename versions remain reachable through --follow.
 func (s *Store) LogDetailed(relPath string, n int) ([]LogEntry, error) {
 	// "|" separates fields; it cannot appear in %h/%aI and is rare enough in
 	// names/subjects that SplitN(…, 4) keeps any later pipes inside Subject.
 	const sep = "|"
 	out, err := s.git("log", fmt.Sprintf("-n%d", n),
-		"--diff-filter=d", // skip commits that deleted the path
+		"--follow",         // walk across renames so a renamed device keeps its versions
+		"--diff-filter=dr", // skip commits that deleted or merely moved the path
 		"--pretty=format:%h"+sep+"%an"+sep+"%aI"+sep+"%s", "--", relPath)
 	if err != nil {
 		return nil, err
@@ -212,6 +269,40 @@ func (s *Store) RemoveDevice(relPath string) error {
 		return fmt.Errorf("committing removal of %s: %w", relPath, err)
 	}
 	s.pruneEmptyParents(full)
+	return nil
+}
+
+// RenameDevice moves a device's backup file from oldRel to newRel with a
+// git mv + commit, so the file's version history continues under the new
+// path (--follow walks across the rename). A missing old path is not an
+// error (the device was never backed up — there is nothing to carry over);
+// an occupied new path is refused so no history is silently overwritten.
+func (s *Store) RenameDevice(oldRel, newRel string) error {
+	oldRel, newRel = filepath.Clean(oldRel), filepath.Clean(newRel)
+	for _, p := range []string{oldRel, newRel} {
+		if strings.HasPrefix(p, "..") || filepath.IsAbs(p) || p == "." {
+			return fmt.Errorf("invalid backup path %q", p)
+		}
+	}
+	if oldRel == newRel {
+		return nil
+	}
+	if _, err := s.git("ls-files", "--error-unmatch", "--", oldRel); err != nil {
+		if _, statErr := os.Stat(filepath.Join(s.Dir, newRel)); statErr == nil {
+			return fmt.Errorf("target backup file %s already exists; remove the new device first", newRel)
+		}
+		return nil // never backed up: nothing to move
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, newRel)); err == nil {
+		return fmt.Errorf("target backup file %s already exists; remove the new device first", newRel)
+	}
+	if _, err := s.git("mv", "--", oldRel, newRel); err != nil {
+		return fmt.Errorf("moving %s to %s: %w", oldRel, newRel, err)
+	}
+	if _, err := s.git("commit", "-q", "-m", "Rename backup of "+oldRel+" to "+newRel, "--", oldRel, newRel); err != nil {
+		return fmt.Errorf("committing rename of %s to %s: %w", oldRel, newRel, err)
+	}
+	s.pruneEmptyParents(filepath.Join(s.Dir, oldRel))
 	return nil
 }
 

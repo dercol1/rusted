@@ -20,7 +20,7 @@ func deviceCmd() *cobra.Command {
 		Aliases: []string{"dev", "devices"},
 		Short:   "Manage devices",
 	}
-	c.AddCommand(deviceAddCmd(), deviceListCmd(), deviceUpdateCmd(), deviceRemoveCmd(), deviceEnableCmd(true), deviceEnableCmd(false))
+	c.AddCommand(deviceAddCmd(), deviceListCmd(), deviceUpdateCmd(), deviceRenameCmd(), deviceRemoveCmd(), deviceEnableCmd(true), deviceEnableCmd(false))
 	return c
 }
 
@@ -271,6 +271,67 @@ func deviceRemoveCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&purgeHistory, "purge-history", false,
 		"also erase this device's configs from the backup repository history (irreversible, needs git-filter-repo)")
+	return cmd
+}
+
+// deviceRenameCmd renames a device in place: same row id (SQLite run history
+// stays attached) and a git mv of the config file (git versions stay reachable
+// via --follow / path resolution at old commits).
+func deviceRenameCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "rename OLD NEW",
+		Aliases: []string{"mv", "move"},
+		Short:   "Rename a device, carrying its history across",
+		Long: "Rename a device without losing anything: the store row keeps its id\n" +
+			"(so 'rusted backup history NEW' still lists the runs recorded under\n" +
+			"OLD) and the backup file [group/]OLD.cfg is moved to\n" +
+			"[group/]NEW.cfg in the git repository, so every old version stays\n" +
+			"visible, viewable and diffable under the new name. Use this instead\n" +
+			"of 'device add NEW' + 'device rm OLD', which drops the history.\n\n" +
+			"Other fields (host, port, driver, credential, ...) are left alone —\n" +
+			"adjust them afterwards with 'device update'.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := openStore()
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			old, err := lookupDevice(st, args[0])
+			if err != nil {
+				return err
+			}
+			newName := args[1]
+			if _, err := st.GetDevice(newName); err == nil {
+				return fmt.Errorf("device %q already exists; rename it away or remove it first", newName)
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+
+			rel := old.Name + ".cfg"
+			newRel := newName + ".cfg"
+			if old.Group != "" {
+				rel = old.Group + "/" + rel
+				newRel = old.Group + "/" + newRel
+			}
+
+			gs, err := openGit()
+			if err != nil {
+				return err
+			}
+			// Git first, DB after: a failed move leaves the device registered
+			// under its old name (mirrors 'device remove').
+			if err := gs.RenameDevice(rel, newRel); err != nil {
+				return fmt.Errorf("device not renamed; %w", err)
+			}
+			if err := st.RenameDevice(old.Name, newName); err != nil {
+				return err
+			}
+			fmt.Printf("device %q renamed to %q (history preserved)\n", old.Name, newName)
+			return nil
+		},
+	}
 	return cmd
 }
 
